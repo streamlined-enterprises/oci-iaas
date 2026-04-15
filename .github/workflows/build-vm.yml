@@ -255,7 +255,11 @@ jobs:
           fi
           PRIVATE_IP_ID=$(oci network private-ip list \
             --vnic-id $VNIC_ID \
-            --query 'data[0].id' --raw-output)
+            --query 'data[0].id' --raw-output 2>/dev/null)
+          if [ -z "$PRIVATE_IP_ID" ] || [ "$PRIVATE_IP_ID" = "null" ]; then
+            echo "ERROR: Could not retrieve private IP ID for VNIC $VNIC_ID"
+            exit 1
+          fi
           PIP_NAME="${{ inputs.env_name }}-reserved-ip"
           PIP_ID=$(oci network public-ip list \
             --compartment-id $COMPARTMENT_OCID \
@@ -274,7 +278,7 @@ jobs:
           else
             oci network public-ip update \
               --public-ip-id $PIP_ID \
-              --private-ip-id $PRIVATE_IP_ID || true
+              --private-ip-id $PRIVATE_IP_ID 2>/dev/null || echo "Update skipped (may already be assigned)"
             IP=$(oci network public-ip get \
               --public-ip-id $PIP_ID \
               --query 'data.ip-address' --raw-output)
