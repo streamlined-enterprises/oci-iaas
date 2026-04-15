@@ -269,11 +269,13 @@ jobs:
           fi
 
           PIP_NAME="${{ inputs.env_name }}-reserved-ip"
+          # oci network public-ip list does not support --display-name;
+          # fetch all reserved IPs in the region and filter client-side with JMESPath.
           PIP_ID=$(oci network public-ip list \
             --compartment-id $COMPARTMENT_OCID \
             --scope REGION \
-            --display-name "$PIP_NAME" \
-            --query 'data[0].id' --raw-output 2>/dev/null || true)
+            --query "data[?\"display-name\"=='${PIP_NAME}'] | [0].id" \
+            --raw-output 2>/dev/null || true)
 
           if [ -z "$PIP_ID" ] || [ "$PIP_ID" = "null" ]; then
             # No reserved IP exists yet — create and assign it
