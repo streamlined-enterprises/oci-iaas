@@ -241,6 +241,7 @@ jobs:
       - name: Assign Reserved Public IP
         id: public_ip
         run: |
+          # Wait for VNIC to become available
           for i in $(seq 1 10); do
             VNIC_ID=$(oci compute instance list-vnics \
               --instance-id ${{ steps.instance.outputs.id }} \
@@ -253,6 +254,7 @@ jobs:
             echo "ERROR: Could not retrieve VNIC after 10 attempts."
             exit 1
           fi
+
           PRIVATE_IP_ID=$(oci network private-ip list \
             --vnic-id $VNIC_ID \
             --query 'data[0].id' --raw-output 2>/dev/null)
@@ -260,13 +262,16 @@ jobs:
             echo "ERROR: Could not retrieve private IP ID for VNIC $VNIC_ID"
             exit 1
           fi
+
           PIP_NAME="${{ inputs.env_name }}-reserved-ip"
           PIP_ID=$(oci network public-ip list \
             --compartment-id $COMPARTMENT_OCID \
             --scope REGION \
             --display-name "$PIP_NAME" \
             --query 'data[0].id' --raw-output 2>/dev/null)
+
           if [ -z "$PIP_ID" ] || [ "$PIP_ID" = "null" ]; then
+            # No reserved IP exists yet — create and assign it
             IP=$(oci network public-ip create \
               --compartment-id $COMPARTMENT_OCID \
               --lifetime RESERVED \
@@ -276,13 +281,30 @@ jobs:
               --query 'data.ip-address' --raw-output)
             echo "Created and assigned reserved IP: $IP"
           else
-            oci network public-ip update \
+            # Reserved IP exists — check if it's already assigned to the correct private IP
+            CURRENT_PRIVATE_IP_ID=$(oci network public-ip get \
               --public-ip-id $PIP_ID \
-              --private-ip-id $PRIVATE_IP_ID 2>/dev/null || echo "Update skipped (may already be assigned)"
+              --query 'data."assigned-entity-id"' --raw-output 2>/dev/null || echo "null")
+
+            if [ "$CURRENT_PRIVATE_IP_ID" = "$PRIVATE_IP_ID" ]; then
+              echo "Reserved IP already assigned to the correct private IP, skipping update."
+            else
+              # Assigned elsewhere or unassigned — reassign it
+              set +e
+              oci network public-ip update \
+                --public-ip-id $PIP_ID \
+                --private-ip-id $PRIVATE_IP_ID 2>/dev/null
+              UPDATE_EXIT=$?
+              set -e
+              if [ $UPDATE_EXIT -ne 0 ]; then
+                echo "Warning: public-ip update returned exit code $UPDATE_EXIT — may already be in desired state."
+              fi
+            fi
+
             IP=$(oci network public-ip get \
               --public-ip-id $PIP_ID \
               --query 'data.ip-address' --raw-output)
-            echo "Re-assigned existing reserved IP: $IP"
+            echo "Reserved IP: $IP"
           fi
           echo "ip=$IP" >> $GITHUB_OUTPUT
 
