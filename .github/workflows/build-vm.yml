@@ -285,7 +285,7 @@ jobs:
               --display-name "$PIP_NAME" \
               --private-ip-id $PRIVATE_IP_ID \
               --wait-for-state ASSIGNED \
-              --query 'data.ip-address' --raw-output)
+              --query 'data."ip-address"' --raw-output)
             echo "Created and assigned reserved IP: $IP"
           else
             # Reserved IP exists — check if it's already assigned to the correct private IP
@@ -313,7 +313,7 @@ jobs:
 
             IP=$(oci network public-ip get \
               --public-ip-id $PIP_ID \
-              --query 'data.ip-address' --raw-output)
+              --query 'data."ip-address"' --raw-output)
             echo "Reserved IP: $IP"
           fi
           echo "ip=$IP" >> $GITHUB_OUTPUT
