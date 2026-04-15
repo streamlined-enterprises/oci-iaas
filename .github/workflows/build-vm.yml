@@ -26,6 +26,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Preflight — verify required secrets
+        run: |
+          : "${COMPARTMENT_OCID:?OCI_COMPARTMENT_OCID secret is not set or empty. Go to repo Settings → Secrets and add it.}"
+          echo "Preflight passed: COMPARTMENT_OCID is set."
+
       - name: Install OCI CLI
         run: |
           curl -L https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh -o install.sh
@@ -268,7 +273,7 @@ jobs:
             --compartment-id $COMPARTMENT_OCID \
             --scope REGION \
             --display-name "$PIP_NAME" \
-            --query 'data[0].id' --raw-output 2>/dev/null)
+            --query 'data[0].id' --raw-output 2>/dev/null || true)
 
           if [ -z "$PIP_ID" ] || [ "$PIP_ID" = "null" ]; then
             # No reserved IP exists yet — create and assign it
