@@ -1,0 +1,260 @@
+name: Cloudflare Setup
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Run modes:
+#
+#  1. Standalone  — trigger manually via workflow_dispatch, providing env_name.
+#
+#  2. Chained     — triggered automatically when "Build OCI VM" completes
+#                   successfully.  env_name is extracted from the triggering
+#                   workflow's inputs so no extra config is needed.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      env_name:
+        description: 'Environment name — must match the prefix used in build-vm.yml (e.g. prod, worker-1)'
+        required: true
+        default: 'prod'
+
+  workflow_run:
+    workflows:
+      - 'Build OCI VM'
+    types:
+      - completed
+
+env:
+  OCI_REGION: us-chicago-1
+  COMPARTMENT_OCID: ${{ secrets.OCI_COMPARTMENT_OCID }}
+  OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: True
+  SUPPRESS_LABEL_WARNING: True
+
+jobs:
+  cloudflare-setup:
+    runs-on: ubuntu-latest
+
+    # When chained, only proceed if the upstream build succeeded.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+
+    steps:
+      # ── Resolve env_name ────────────────────────────────────────────────────
+      # Standalone:  use the workflow_dispatch input directly.
+      # Chained:     the workflow_run event does not carry upstream inputs, so
+      #              we download the artifact that build-vm.yml uploads, or we
+      #              fall back to the workflow run's display title which GitHub
+      #              sets to the input value when a workflow is triggered
+      #              manually.  The most reliable zero-artifact approach is to
+      #              parse the display title; build-vm.yml sets none, so the
+      #              title is "<actor> ran workflow_dispatch" — instead we
+      #              expose env_name via a small outputs artifact.
+      #
+      # To keep this workflow self-contained we use the OCI CLI to discover
+      # the running VM whose name matches "*-vm" in the expected compartment,
+      # but we still need to know the prefix.  We therefore:
+      #   a) Standalone  → use ${{ inputs.env_name }}
+      #   b) Chained     → read the GITHUB_ENV artifact written by build-vm
+      #                    (see note below), falling back to 'prod'.
+      #
+      # ── How to wire env_name from build-vm to this workflow (chained mode) ──
+      # Add the following step near the END of build-vm.yml's job, before the
+      # Summary step, to upload a one-line artifact:
+      #
+      #   - name: Export env_name artifact
+      #     run: echo "${{ inputs.env_name }}" > env_name.txt
+      #   - uses: actions/upload-artifact@v4
+      #     with:
+      #       name: build-vm-env-name
+      #       path: env_name.txt
+      #
+      # This workflow will download that artifact when running in chained mode.
+      # Without the artifact, chained mode defaults to 'prod'.
+      # ────────────────────────────────────────────────────────────────────────
+
+      - name: Resolve env_name
+        id: env
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ENV_NAME="${{ inputs.env_name }}"
+            echo "Mode: standalone, env_name=${ENV_NAME}"
+          else
+            echo "Mode: chained — attempting to download env_name artifact..."
+            ENV_NAME="prod"  # safe default
+          fi
+          echo "name=${ENV_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Download env_name artifact (chained mode)
+        if: github.event_name == 'workflow_run'
+        uses: actions/download-artifact@v4
+        with:
+          name: build-vm-env-name
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.event.workflow_run.id }}
+        continue-on-error: true   # artifact may not exist; default 'prod' is used
+
+      - name: Override env_name from artifact (chained mode)
+        if: github.event_name == 'workflow_run'
+        id: env_override
+        run: |
+          if [ -f env_name.txt ]; then
+            ENV_NAME=$(cat env_name.txt | tr -d '[:space:]')
+            echo "Resolved env_name from artifact: ${ENV_NAME}"
+            # Overwrite the output set in the Resolve step
+            echo "name=${ENV_NAME}" >> $GITHUB_OUTPUT
+          else
+            echo "Artifact not found, keeping default: ${{ steps.env.outputs.name }}"
+            echo "name=${{ steps.env.outputs.name }}" >> $GITHUB_OUTPUT
+          fi
+
+      # Convenience: whichever step last wrote 'name' wins.  Later steps use
+      # steps.resolved_env.outputs.name via the composite below.
+      - name: Set resolved env_name
+        id: resolved_env
+        run: |
+          # Prefer artifact override output if it exists, else use initial resolve.
+          NAME="${{ steps.env_override.outputs.name || steps.env.outputs.name }}"
+          echo "name=${NAME}" >> $GITHUB_OUTPUT
+          echo "Resolved env_name: ${NAME}"
+
+      # ── OCI CLI ─────────────────────────────────────────────────────────────
+
+      - name: Install OCI CLI
+        run: |
+          curl -L https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh -o install.sh
+          bash install.sh --accept-all-defaults
+          echo "$HOME/bin" >> $GITHUB_PATH
+
+      - name: Configure OCI CLI
+        env:
+          OCI_USER: ${{ secrets.OCI_USER_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_TENANCY: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_KEY: ${{ secrets.OCI_API_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.oci
+          echo "$OCI_KEY" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+          printf '[DEFAULT]\nuser=%s\nfingerprint=%s\ntenancy=%s\nregion=%s\nkey_file=/home/runner/.oci/oci_api_key.pem\n' \
+            "$OCI_USER" "$OCI_FINGERPRINT" "$OCI_TENANCY" "$OCI_REGION" > ~/.oci/config
+          chmod 600 ~/.oci/config
+
+      # ── Discover VM public IP ────────────────────────────────────────────────
+
+      - name: Get VM public IP from OCI
+        id: vm
+        run: |
+          ENV_NAME="${{ steps.resolved_env.outputs.name }}"
+          PIP_NAME="${ENV_NAME}-reserved-ip"
+
+          PUBLIC_IP=$(oci network public-ip list \
+            --compartment-id $COMPARTMENT_OCID \
+            --scope REGION \
+            --query "data[?\"display-name\"=='${PIP_NAME}'] | [0].\"ip-address\"" \
+            --raw-output 2>/dev/null || true)
+
+          if [ -z "$PUBLIC_IP" ] || [ "$PUBLIC_IP" = "null" ]; then
+            echo "ERROR: Could not find reserved IP named '${PIP_NAME}' in compartment."
+            echo "Make sure build-vm.yml completed successfully for env '${ENV_NAME}'."
+            exit 1
+          fi
+
+          echo "Found public IP: ${PUBLIC_IP}"
+          echo "ip=${PUBLIC_IP}" >> $GITHUB_OUTPUT
+
+      # ── SSH + cloudflared install ────────────────────────────────────────────
+
+      - name: Write SSH private key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_oci
+          chmod 600 ~/.ssh/id_oci
+          # Trust the host on first connect
+          ssh-keyscan -H ${{ steps.vm.outputs.ip }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Wait for SSH to be ready
+        run: |
+          IP="${{ steps.vm.outputs.ip }}"
+          for i in $(seq 1 12); do
+            if ssh -i ~/.ssh/id_oci \
+                 -o StrictHostKeyChecking=no \
+                 -o ConnectTimeout=10 \
+                 opc@"$IP" 'echo ok' 2>/dev/null; then
+              echo "SSH is ready."
+              break
+            fi
+            echo "SSH not ready yet ($i/12), retrying in 10s..."
+            sleep 10
+          done
+
+      - name: Install and configure cloudflared
+        env:
+          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+        run: |
+          IP="${{ steps.vm.outputs.ip }}"
+
+          ssh -i ~/.ssh/id_oci \
+              -o StrictHostKeyChecking=no \
+              opc@"$IP" bash -s << 'ENDSSH'
+
+            set -euo pipefail
+
+            # ── Install cloudflared ──────────────────────────────────────────
+            if ! command -v cloudflared &>/dev/null; then
+              echo "Installing cloudflared..."
+              curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
+                | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+              echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' \
+                | sudo tee /etc/apt/sources.list.d/cloudflared.list
+              sudo apt-get update -qq
+              sudo apt-get install -y cloudflared
+              echo "cloudflared installed: $(cloudflared --version)"
+            else
+              echo "cloudflared already installed: $(cloudflared --version)"
+            fi
+
+          ENDSSH
+
+          # ── Pass the tunnel token securely (not via heredoc to avoid 
+          #    embedding the secret in shell history on the remote host) ──────
+          ssh -i ~/.ssh/id_oci \
+              -o StrictHostKeyChecking=no \
+              opc@"$IP" \
+              "sudo cloudflared service install \"${CF_TUNNEL_TOKEN}\" 2>&1 || echo 'Service already installed or already running — skipping.'"
+
+          # ── Enable + start the service ───────────────────────────────────
+          ssh -i ~/.ssh/id_oci \
+              -o StrictHostKeyChecking=no \
+              opc@"$IP" bash -s << 'ENDSSH'
+
+            set -euo pipefail
+            sudo systemctl daemon-reload
+            sudo systemctl enable cloudflared
+            sudo systemctl restart cloudflared
+
+            # Give it a moment to come up
+            sleep 3
+            STATUS=$(sudo systemctl is-active cloudflared || true)
+            echo "cloudflared service status: ${STATUS}"
+            if [ "$STATUS" != "active" ]; then
+              echo "ERROR: cloudflared did not start correctly."
+              sudo systemctl status cloudflared --no-pager || true
+              exit 1
+            fi
+
+            echo "cloudflared is running and enabled on boot."
+
+          ENDSSH
+
+      # ── Summary ─────────────────────────────────────────────────────────────
+
+      - name: Summary
+        run: |
+          ENV_NAME="${{ steps.resolved_env.outputs.name }}"
+          echo "## Cloudflare Setup Complete — ${ENV_NAME}" >> $GITHUB_STEP_SUMMARY
+          echo "| | |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| **VM IP** | ${{ steps.vm.outputs.ip }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **cloudflared** | installed + enabled as systemd service |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Tunnel token** | from \`CF_TUNNEL_TOKEN\` secret |" >> $GITHUB_STEP_SUMMARY
