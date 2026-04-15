@@ -1,0 +1,299 @@
+name: Build OCI VM
+
+on:
+  workflow_dispatch:
+    inputs:
+      env_name:
+        description: 'Environment name — used to prefix all resource names (e.g. prod, worker-1, worker-2)'
+        required: true
+        default: 'prod'
+      rebuild:
+        description: 'Terminate and rebuild the VM if it already exists'
+        required: false
+        default: 'false'
+        type: boolean
+
+env:
+  OCI_REGION: us-chicago-1
+  COMPARTMENT_OCID: ${{ secrets.OCI_COMPARTMENT_OCID }}
+  INSTANCE_SHAPE: VM.Standard.A1.Flex
+  IMAGE_OCID: ocid1.image.oc1.us-chicago-1.aaaaaaaasrbvw2qh25ewu3gg2div6bkwvqdi2oilwxirhic3qa5tzzxrcdwa
+
+jobs:
+  build-vm:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install OCI CLI
+        run: |
+          curl -L https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh -o install.sh
+          bash install.sh --accept-all-defaults
+          echo "$HOME/bin" >> $GITHUB_PATH
+
+      - name: Configure OCI CLI
+        run: |
+          mkdir -p ~/.oci
+          echo "${{ secrets.OCI_API_PRIVATE_KEY }}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+          cat > ~/.oci/config << EOF
+          [DEFAULT]
+          user=${{ secrets.OCI_USER_OCID }}
+          fingerprint=${{ secrets.OCI_FINGERPRINT }}
+          tenancy=${{ secrets.OCI_TENANCY_OCID }}
+          region=${OCI_REGION}
+          key_file=~/.oci/oci_api_key.pem
+          EOF
+
+      # ── Networking ────────────────────────────────────────────
+
+      - name: Create VCN
+        id: vcn
+        run: |
+          NAME="${{ inputs.env_name }}-vcn"
+          ID=$(oci network vcn list \
+            --compartment-id $COMPARTMENT_OCID \
+            --display-name "$NAME" \
+            --query 'data[0].id' --raw-output 2>/dev/null)
+          if [ -z "$ID" ] || [ "$ID" = "null" ]; then
+            ID=$(oci network vcn create \
+              --compartment-id $COMPARTMENT_OCID \
+              --cidr-block "10.0.0.0/16" \
+              --display-name "$NAME" \
+              --dns-label "$(echo ${{ inputs.env_name }} | tr '-' 'x')vcn" \
+              --wait-for-state AVAILABLE \
+              --query 'data.id' --raw-output)
+            echo "Created VCN: $ID"
+          else
+            echo "VCN exists, skipping: $ID"
+          fi
+          echo "id=$ID" >> $GITHUB_OUTPUT
+
+      - name: Create Internet Gateway
+        id: igw
+        run: |
+          NAME="${{ inputs.env_name }}-igw"
+          ID=$(oci network internet-gateway list \
+            --compartment-id $COMPARTMENT_OCID \
+            --vcn-id ${{ steps.vcn.outputs.id }} \
+            --display-name "$NAME" \
+            --query 'data[0].id' --raw-output 2>/dev/null)
+          if [ -z "$ID" ] || [ "$ID" = "null" ]; then
+            ID=$(oci network internet-gateway create \
+              --compartment-id $COMPARTMENT_OCID \
+              --vcn-id ${{ steps.vcn.outputs.id }} \
+              --display-name "$NAME" \
+              --is-enabled true \
+              --wait-for-state AVAILABLE \
+              --query 'data.id' --raw-output)
+            echo "Created IGW: $ID"
+          else
+            echo "IGW exists, skipping: $ID"
+          fi
+          echo "id=$ID" >> $GITHUB_OUTPUT
+
+      - name: Create Route Table
+        id: rt
+        run: |
+          NAME="${{ inputs.env_name }}-route-table"
+          ID=$(oci network route-table list \
+            --compartment-id $COMPARTMENT_OCID \
+            --vcn-id ${{ steps.vcn.outputs.id }} \
+            --display-name "$NAME" \
+            --query 'data[0].id' --raw-output 2>/dev/null)
+          if [ -z "$ID" ] || [ "$ID" = "null" ]; then
+            ID=$(oci network route-table create \
+              --compartment-id $COMPARTMENT_OCID \
+              --vcn-id ${{ steps.vcn.outputs.id }} \
+              --display-name "$NAME" \
+              --route-rules "[{\"cidrBlock\":\"0.0.0.0/0\",\"networkEntityId\":\"${{ steps.igw.outputs.id }}\"}]" \
+              --wait-for-state AVAILABLE \
+              --query 'data.id' --raw-output)
+            echo "Created route table: $ID"
+          else
+            echo "Route table exists, skipping: $ID"
+          fi
+          echo "id=$ID" >> $GITHUB_OUTPUT
+
+      - name: Create NSG + Security Rules
+        id: nsg
+        run: |
+          NAME="${{ inputs.env_name }}-nsg"
+          ID=$(oci network nsg list \
+            --compartment-id $COMPARTMENT_OCID \
+            --vcn-id ${{ steps.vcn.outputs.id }} \
+            --display-name "$NAME" \
+            --query 'data[0].id' --raw-output 2>/dev/null)
+          if [ -z "$ID" ] || [ "$ID" = "null" ]; then
+            ID=$(oci network nsg create \
+              --compartment-id $COMPARTMENT_OCID \
+              --vcn-id ${{ steps.vcn.outputs.id }} \
+              --display-name "$NAME" \
+              --wait-for-state AVAILABLE \
+              --query 'data.id' --raw-output)
+            # SSH ingress only — HTTP/HTTPS added by cloudflare layer later
+            oci network nsg rules add --nsg-id $ID --security-rules '[
+              {"direction":"INGRESS","protocol":"6","source":"0.0.0.0/0","sourceType":"CIDR_BLOCK",
+               "tcpOptions":{"destinationPortRange":{"min":22,"max":22}}},
+              {"direction":"EGRESS","protocol":"all","destination":"0.0.0.0/0","destinationType":"CIDR_BLOCK"}
+            ]'
+            echo "Created NSG with SSH + egress rules: $ID"
+          else
+            echo "NSG exists, skipping: $ID"
+          fi
+          echo "id=$ID" >> $GITHUB_OUTPUT
+
+      - name: Create Subnet
+        id: subnet
+        run: |
+          # availability domain index 1 per original config
+          AD=$(oci iam availability-domain list \
+            --compartment-id ${{ secrets.OCI_TENANCY_OCID }} \
+            --query 'data[1].name' --raw-output)
+          echo "ad=$AD" >> $GITHUB_OUTPUT
+
+          NAME="${{ inputs.env_name }}-subnet"
+          ID=$(oci network subnet list \
+            --compartment-id $COMPARTMENT_OCID \
+            --vcn-id ${{ steps.vcn.outputs.id }} \
+            --display-name "$NAME" \
+            --query 'data[0].id' --raw-output 2>/dev/null)
+          if [ -z "$ID" ] || [ "$ID" = "null" ]; then
+            ID=$(oci network subnet create \
+              --compartment-id $COMPARTMENT_OCID \
+              --vcn-id ${{ steps.vcn.outputs.id }} \
+              --availability-domain "$AD" \
+              --cidr-block "10.0.1.0/24" \
+              --display-name "$NAME" \
+              --dns-label "$(echo ${{ inputs.env_name }} | tr '-' 'x')sub" \
+              --route-table-id ${{ steps.rt.outputs.id }} \
+              --wait-for-state AVAILABLE \
+              --query 'data.id' --raw-output)
+            echo "Created subnet: $ID"
+          else
+            echo "Subnet exists, skipping: $ID"
+          fi
+          echo "id=$ID" >> $GITHUB_OUTPUT
+
+      # ── Compute ───────────────────────────────────────────────
+
+      - name: Terminate existing VM
+        if: ${{ inputs.rebuild == 'true' }}
+        run: |
+          VM_NAME="${{ inputs.env_name }}-vm"
+          ID=$(oci compute instance list \
+            --compartment-id $COMPARTMENT_OCID \
+            --display-name "$VM_NAME" \
+            --lifecycle-state RUNNING \
+            --query 'data[0].id' --raw-output 2>/dev/null)
+          if [ -n "$ID" ] && [ "$ID" != "null" ]; then
+            echo "Terminating $ID..."
+            oci compute instance terminate \
+              --instance-id $ID \
+              --preserve-boot-volume false \
+              --force \
+              --wait-for-state TERMINATED
+            echo "Terminated."
+          else
+            echo "No running VM found, nothing to terminate."
+          fi
+
+      - name: Launch VM (with capacity retry)
+        id: instance
+        run: |
+          VM_NAME="${{ inputs.env_name }}-vm"
+          ID=$(oci compute instance list \
+            --compartment-id $COMPARTMENT_OCID \
+            --display-name "$VM_NAME" \
+            --lifecycle-state RUNNING \
+            --query 'data[0].id' --raw-output 2>/dev/null)
+
+          if [ -n "$ID" ] && [ "$ID" != "null" ]; then
+            echo "VM already running: $ID"
+          else
+            echo "Launching VM — will retry on capacity errors..."
+            for attempt in $(seq 1 20); do
+              ID=$(oci compute instance launch \
+                --compartment-id $COMPARTMENT_OCID \
+                --availability-domain "${{ steps.subnet.outputs.ad }}" \
+                --display-name "$VM_NAME" \
+                --shape $INSTANCE_SHAPE \
+                --shape-config '{"ocpus":1,"memoryInGBs":6}' \
+                --image-id $IMAGE_OCID \
+                --subnet-id ${{ steps.subnet.outputs.id }} \
+                --assign-public-ip false \
+                --private-ip "10.0.1.10" \
+                --nsg-ids "[\"${{ steps.nsg.outputs.id }}\"]" \
+                --ssh-authorized-keys-file <(echo "${{ secrets.SSH_PUBLIC_KEY }}") \
+                --boot-volume-size-in-gbs 50 \
+                --freeform-tags "{\"env\":\"${{ inputs.env_name }}\"}" \
+                --wait-for-state RUNNING \
+                --query 'data.id' --raw-output 2>/dev/null) && break
+              echo "Attempt $attempt/20 failed (likely capacity). Retrying in 30s..."
+              sleep 30
+            done
+            if [ -z "$ID" ] || [ "$ID" = "null" ]; then
+              echo "Failed to launch VM after 20 attempts."
+              exit 1
+            fi
+            echo "Launched VM: $ID"
+          fi
+          echo "id=$ID" >> $GITHUB_OUTPUT
+
+      # ── Reserved Public IP ────────────────────────────────────
+
+      - name: Assign Reserved Public IP
+        id: public_ip
+        run: |
+          # Wait for VNIC to be fully propagated after launch
+          for i in $(seq 1 10); do
+            VNIC_ID=$(oci compute instance list-vnics \
+              --instance-id ${{ steps.instance.outputs.id }} \
+              --query 'data[0].id' --raw-output 2>/dev/null)
+            [ -n "$VNIC_ID" ] && [ "$VNIC_ID" != "null" ] && break
+            echo "Waiting for VNIC... ($i/10)"
+            sleep 10
+          done
+
+          PRIVATE_IP_ID=$(oci network private-ip list \
+            --vnic-id $VNIC_ID \
+            --query 'data[0].id' --raw-output)
+
+          PIP_NAME="${{ inputs.env_name }}-reserved-ip"
+          PIP_ID=$(oci network public-ip list \
+            --compartment-id $COMPARTMENT_OCID \
+            --scope REGION \
+            --display-name "$PIP_NAME" \
+            --query 'data[0].id' --raw-output 2>/dev/null)
+
+          if [ -z "$PIP_ID" ] || [ "$PIP_ID" = "null" ]; then
+            IP=$(oci network public-ip create \
+              --compartment-id $COMPARTMENT_OCID \
+              --lifetime RESERVED \
+              --display-name "$PIP_NAME" \
+              --private-ip-id $PRIVATE_IP_ID \
+              --wait-for-state ASSIGNED \
+              --query 'data.ip-address' --raw-output)
+            echo "Created and assigned reserved IP: $IP"
+          else
+            # Re-assign to current VM's VNIC (handles rebuild case)
+            oci network public-ip update \
+              --public-ip-id $PIP_ID \
+              --private-ip-id $PRIVATE_IP_ID || true
+            IP=$(oci network public-ip get \
+              --public-ip-id $PIP_ID \
+              --query 'data.ip-address' --raw-output)
+            echo "Re-assigned existing reserved IP: $IP"
+          fi
+          echo "ip=$IP" >> $GITHUB_OUTPUT
+
+      # ── Done ──────────────────────────────────────────────────
+
+      - name: Summary
+        run: |
+          echo "## ✅ VM Ready — ${{ inputs.env_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "| | |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Instance ID** | \`${{ steps.instance.outputs.id }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Public IP** | \`${{ steps.public_ip.outputs.ip }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **SSH** | \`ssh -i ~/.ssh/ssh.key opc@${{ steps.public_ip.outputs.ip }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Shape** | ${INSTANCE_SHAPE} — 1 OCPU / 6 GB |" >> $GITHUB_STEP_SUMMARY
