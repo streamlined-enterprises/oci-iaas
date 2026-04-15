@@ -282,9 +282,12 @@ jobs:
             echo "Created and assigned reserved IP: $IP"
           else
             # Reserved IP exists — check if it's already assigned to the correct private IP
+            set +e
             CURRENT_PRIVATE_IP_ID=$(oci network public-ip get \
               --public-ip-id $PIP_ID \
-              --query 'data."assigned-entity-id"' --raw-output 2>/dev/null || echo "null")
+              --query 'data."assigned-entity-id"' --raw-output 2>/dev/null)
+            set -e
+            CURRENT_PRIVATE_IP_ID="${CURRENT_PRIVATE_IP_ID:-null}"
 
             if [ "$CURRENT_PRIVATE_IP_ID" = "$PRIVATE_IP_ID" ]; then
               echo "Reserved IP already assigned to the correct private IP, skipping update."
