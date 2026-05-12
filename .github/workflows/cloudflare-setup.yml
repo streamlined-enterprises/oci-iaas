@@ -40,7 +40,7 @@ jobs:
       (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
 
     steps:
-      # ── Resolve env_name ────────────────────────────────────────────────────
+      # ── Resolve env_name ───────────────────────────────────────────────────
       # Standalone : use the workflow_dispatch input directly.
       # Chained    : download the artifact that build-vm.yml uploads.
       #
@@ -55,7 +55,7 @@ jobs:
       #       path: env_name.txt
       #
       # Without the artifact, chained mode falls back to 'prod'.
-      # ────────────────────────────────────────────────────────────────────────
+      # ───────────────────────────────────────────────────────────────────────
 
       - name: Resolve env_name (standalone)
         id: env
@@ -97,7 +97,7 @@ jobs:
           echo "name=${NAME}" >> $GITHUB_OUTPUT
           echo "Final env_name: ${NAME}"
 
-      # ── OCI CLI ─────────────────────────────────────────────────────────────
+      # ── OCI CLI ────────────────────────────────────────────────────────────
 
       - name: Install OCI CLI
         run: |
@@ -119,7 +119,7 @@ jobs:
             "$OCI_USER" "$OCI_FINGERPRINT" "$OCI_TENANCY" "$OCI_REGION" > ~/.oci/config
           chmod 600 ~/.oci/config
 
-      # ── Discover VM public IP ────────────────────────────────────────────────
+      # ── Discover VM public IP ──────────────────────────────────────────────
 
       - name: Get VM public IP from OCI
         id: vm
@@ -141,7 +141,7 @@ jobs:
           echo "Found public IP: ${PUBLIC_IP}"
           echo "ip=${PUBLIC_IP}" >> $GITHUB_OUTPUT
 
-      # ── SSH setup ───────────────────────────────────────────────────────────
+      # ── SSH setup ─────────────────────────────────────────────────────────
 
       - name: Write SSH private key
         run: |
@@ -163,7 +163,7 @@ jobs:
             sleep 10
           done
 
-      # ── Install cloudflared ─────────────────────────────────────────────────
+      # ── Install cloudflared ───────────────────────────────────────────────
       # Remote scripts are base64-encoded so the YAML file contains only
       # properly-indented lines.  The runner decodes them at runtime.
       #
@@ -185,30 +185,44 @@ jobs:
           echo "$SCRIPT_B64" | base64 -d | \
             ssh -i ~/.ssh/id_oci -o StrictHostKeyChecking=no opc@"$IP" 'bash -s'
 
-      # ── Register tunnel + enable service (single atomic step) ────────────────
-      # The script template contains a __TOKEN__ placeholder.  The runner
-      # substitutes the real token via sed before piping over SSH, so the
-      # token value travels only inside the encrypted SSH stream.
+      # ── Register tunnel + enable service ──────────────────────────────────
+      # Token delivery uses a two-phase approach to avoid all shell-quoting
+      # and sed fragility:
       #
-      # Key behaviours:
-      #   - CF_BIN resolved via `command -v` falling back to /usr/local/bin
-      #     so sudo finds it regardless of secure_path
-      #   - daemon-reload runs immediately after service install
-      #   - FOUND flag ensures a clean error if the unit never appears
+      #   Phase 1 — Write token: printf the token (whitespace-stripped) into
+      #             /tmp/.cf_token on the VM via a dedicated SSH command.
+      #             The token travels only inside the encrypted SSH stream.
+      #
+      #   Phase 2 — Run script: pipe the install script separately.
+      #             It reads CF_TOKEN from the file, rm -f's it immediately,
+      #             then calls `cloudflared service install`.
 
-      - name: Register and enable cloudflared service
+      - name: Deliver tunnel token to VM
         env:
           CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
         run: |
           IP="${{ steps.vm.outputs.ip }}"
+          # Strip all whitespace/newlines from the token before writing
+          CLEAN_TOKEN=$(printf '%s' "${CF_TUNNEL_TOKEN}" | tr -d '[:space:]')
+          printf '%s' "${CLEAN_TOKEN}" | \
+            ssh -i ~/.ssh/id_oci -o StrictHostKeyChecking=no opc@"$IP" \
+            'cat > /tmp/.cf_token && chmod 600 /tmp/.cf_token'
 
-          SCRIPT_B64="c2V0IC1ldW8gcGlwZWZhaWwKQ0ZfVE9LRU49J19fVE9LRU5fXycKCiMgTG9jYXRlIGNsb3VkZmxhcmVkIChtYXkgYmUgaW4gL3Vzci9sb2NhbC9iaW4gd2hpY2ggc3VkbydzIHNlY3VyZV9wYXRoIG9taXRzKQpDRl9CSU49JChjb21tYW5kIC12IGNsb3VkZmxhcmVkIDI+L2Rldi9udWxsIHx8IGVjaG8gL3Vzci9sb2NhbC9iaW4vY2xvdWRmbGFyZWQpCmVjaG8gImNsb3VkZmxhcmVkIGJpbmFyeTogJHtDRl9CSU59IgoKZWNobyAiUmVnaXN0ZXJpbmcgY2xvdWRmbGFyZWQgdHVubmVsIHNlcnZpY2UuLi4iCnN1ZG8gIiRDRl9CSU4iIHNlcnZpY2UgaW5zdGFsbCAiJENGX1RPS0VOIiAyPiYxIHx8IGVjaG8gIlNlcnZpY2UgYWxyZWFkeSBpbnN0YWxsZWQsIGNvbnRpbnVpbmcuIgoKIyBkYWVtb24tcmVsb2FkIHNvIHN5c3RlbWQgcGlja3MgdXAgYW55IG5ldyB1bml0IGZpbGVzIHdyaXR0ZW4gYnkgc2VydmljZSBpbnN0YWxsCnN1ZG8gc3lzdGVtY3RsIGRhZW1vbi1yZWxvYWQKCmVjaG8gIldhaXRpbmcgZm9yIHVuaXQgZmlsZS4uLiIKRk9VTkQ9MApmb3IgaSBpbiAkKHNlcSAxIDE1KTsgZG8KICBpZiBzdWRvIHN5c3RlbWN0bCBsaXN0LXVuaXQtZmlsZXMgY2xvdWRmbGFyZWQuc2VydmljZSAyPi9kZXYvbnVsbCB8IGdyZXAgLXEgY2xvdWRmbGFyZWQ7IHRoZW4KICAgIGVjaG8gIlVuaXQgZmlsZSBmb3VuZC4iCiAgICBGT1VORD0xCiAgICBicmVhawogIGZpCiAgZWNobyAiICBOb3QgZm91bmQgeWV0ICgkaS8xNSksIHdhaXRpbmcgMnMuLi4iCiAgc2xlZXAgMgpkb25lCgppZiBbICIkRk9VTkQiID0gIjAiIF07IHRoZW4KICBlY2hvICJFUlJPUjogY2xvdWRmbGFyZWQuc2VydmljZSB1bml0IGZpbGUgbmV2ZXIgYXBwZWFyZWQuIgogIHN1ZG8gc3lzdGVtY3RsIGxpc3QtdW5pdC1maWxlcyB8IGdyZXAgY2xvdWQgfHwgdHJ1ZQogIGV4aXQgMQpmaQoKc3VkbyBzeXN0ZW1jdGwgZW5hYmxlIGNsb3VkZmxhcmVkCnN1ZG8gc3lzdGVtY3RsIHJlc3RhcnQgY2xvdWRmbGFyZWQKc2xlZXAgMwoKU1RBVFVTPSQoc3VkbyBzeXN0ZW1jdGwgaXMtYWN0aXZlIGNsb3VkZmxhcmVkIHx8IHRydWUpCmVjaG8gImNsb3VkZmxhcmVkIHNlcnZpY2Ugc3RhdHVzOiAke1NUQVRVU30iCmlmIFsgIiRTVEFUVVMiICE9ICJhY3RpdmUiIF07IHRoZW4KICBlY2hvICJFUlJPUjogY2xvdWRmbGFyZWQgZGlkIG5vdCBzdGFydCBjb3JyZWN0bHkuIgogIHN1ZG8gc3lzdGVtY3RsIHN0YXR1cyBjbG91ZGZsYXJlZCAtLW5vLXBhZ2VyIHx8IHRydWUKICBleGl0IDEKZmkKZWNobyAiY2xvdWRmbGFyZWQgaXMgcnVubmluZyBhbmQgZW5hYmxlZCBvbiBib290LiIK"
+      - name: Register and enable cloudflared service
+        run: |
+          IP="${{ steps.vm.outputs.ip }}"
 
-          echo "$SCRIPT_B64" | base64 -d \
-            | sed "s|__TOKEN__|${CF_TUNNEL_TOKEN}|g" \
-            | ssh -i ~/.ssh/id_oci -o StrictHostKeyChecking=no opc@"$IP" 'bash -s'
+          # Decoded script:
+          #   CF_TOKEN=$(cat /tmp/.cf_token) && sudo rm -f /tmp/.cf_token
+          #   CF_BIN resolved via command -v, fallback /usr/local/bin
+          #   sudo "$CF_BIN" service install "$CF_TOKEN"
+          #   daemon-reload, wait for unit file, enable, restart, verify active
+          SCRIPT_B64="c2V0IC1ldW8gcGlwZWZhaWwKCiMgUmVhZCB0b2tlbiBmcm9tIHRlbXAgZmlsZSB3cml0dGVuIGJ5IHRoZSBydW5uZXIKQ0ZfVE9LRU49JChjYXQgL3RtcC8uY2ZfdG9rZW4pCnN1ZG8gcm0gLWYgL3RtcC8uY2ZfdG9rZW4KCiMgTG9jYXRlIGNsb3VkZmxhcmVkIChtYXkgYmUgaW4gL3Vzci9sb2NhbC9iaW4gd2hpY2ggc3VkbydzIHNlY3VyZV9wYXRoIG9taXRzKQpDRl9CSU49JChjb21tYW5kIC12IGNsb3VkZmxhcmVkIDI+L2Rldi9udWxsIHx8IGVjaG8gL3Vzci9sb2NhbC9iaW4vY2xvdWRmbGFyZWQpCmVjaG8gImNsb3VkZmxhcmVkIGJpbmFyeTogJHtDRl9CSU59IgoKZWNobyAiUmVnaXN0ZXJpbmcgY2xvdWRmbGFyZWQgdHVubmVsIHNlcnZpY2UuLi4iCnN1ZG8gIiRDRl9CSU4iIHNlcnZpY2UgaW5zdGFsbCAiJENGX1RPS0VOIgoKIyBkYWVtb24tcmVsb2FkIHNvIHN5c3RlbWQgcGlja3MgdXAgdGhlIG5ldyB1bml0IGZpbGUKc3VkbyBzeXN0ZW1jdGwgZGFlbW9uLXJlbG9hZAoKZWNobyAiV2FpdGluZyBmb3IgdW5pdCBmaWxlLi4uIgpGT1VORD0wCmZvciBpIGluICQoc2VxIDEgMTUpOyBkbwogIGlmIHN1ZG8gc3lzdGVtY3RsIGxpc3QtdW5pdC1maWxlcyBjbG91ZGZsYXJlZC5zZXJ2aWNlIDI+L2Rldi9udWxsIHwgZ3JlcCAtcSBjbG91ZGZsYXJlZDsgdGhlbgogICAgZWNobyAiVW5pdCBmaWxlIGZvdW5kLiIKICAgIEZPVU5EPTEKICAgIGJyZWFrCiAgZmkKICBlY2hvICIgIE5vdCBmb3VuZCB5ZXQgKCRpLzE1KSwgd2FpdGluZyAycy4uLiIKICBzbGVlcCAyCmRvbmUKCmlmIFsgIiRGT1VORCIgPSAiMCIgXTsgdGhlbgogIGVjaG8gIkVSUk9SOiBjbG91ZGZsYXJlZC5zZXJ2aWNlIHVuaXQgZmlsZSBuZXZlciBhcHBlYXJlZC4iCiAgc3VkbyBzeXN0ZW1jdGwgbGlzdC11bml0LWZpbGVzIHwgZ3JlcCBjbG91ZCB8fCB0cnVlCiAgZXhpdCAxCmZpCgpzdWRvIHN5c3RlbWN0bCBlbmFibGUgY2xvdWRmbGFyZWQKc3VkbyBzeXN0ZW1jdGwgcmVzdGFydCBjbG91ZGZsYXJlZApzbGVlcCAzCgpTVEFUVVM9JChzdWRvIHN5c3RlbWN0bCBpcy1hY3RpdmUgY2xvdWRmbGFyZWQgfHwgdHJ1ZSkKZWNobyAiY2xvdWRmbGFyZWQgc2VydmljZSBzdGF0dXM6ICR7U1RBVFVTfSIKaWYgWyAiJFNUQVRVUyIgIT0gImFjdGl2ZSIgXTsgdGhlbgogIGVjaG8gIkVSUk9SOiBjbG91ZGZsYXJlZCBkaWQgbm90IHN0YXJ0IGNvcnJlY3RseS4iCiAgc3VkbyBzeXN0ZW1jdGwgc3RhdHVzIGNsb3VkZmxhcmVkIC0tbm8tcGFnZXIgfHwgdHJ1ZQogIGV4aXQgMQpmaQplY2hvICJjbG91ZGZsYXJlZCBpcyBydW5uaW5nIGFuZCBlbmFibGVkIG9uIGJvb3QuIgo="
 
-      # ── Summary ─────────────────────────────────────────────────────────────
+          echo "$SCRIPT_B64" | base64 -d | \
+            ssh -i ~/.ssh/id_oci -o StrictHostKeyChecking=no opc@"$IP" 'bash -s'
+
+      # ── Summary ────────────────────────────────────────────────────────────
 
       - name: Summary
         run: |
