@@ -203,6 +203,7 @@ jobs:
             # ── Install cloudflared ──────────────────────────────────────────
             if ! command -v cloudflared &>/dev/null; then
               echo "Installing cloudflared..."
+              sudo mkdir -p /usr/share/keyrings
               curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
                 | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
               echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' \
@@ -216,7 +217,7 @@ jobs:
 
           ENDSSH
 
-          # ── Pass the tunnel token securely (not via heredoc to avoid 
+          # ── Pass the tunnel token securely (not via heredoc to avoid
           #    embedding the secret in shell history on the remote host) ──────
           ssh -i ~/.ssh/id_oci \
               -o StrictHostKeyChecking=no \
