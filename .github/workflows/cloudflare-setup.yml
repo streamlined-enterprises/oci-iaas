@@ -166,7 +166,7 @@ jobs:
       # ── Install cloudflared ─────────────────────────────────────────────────
       # Remote scripts are base64-encoded so the YAML file contains only
       # properly-indented lines.  The runner decodes them at runtime.
-      # Target OS: Oracle Linux 8/9 (dnf / RPM).
+      # Target OS: Oracle Linux 8/9 aarch64 (dnf / RPM).
 
       - name: Install cloudflared on VM
         run: |
@@ -176,20 +176,14 @@ jobs:
           #   set -euo pipefail
           #   if ! command -v cloudflared &>/dev/null; then
           #     echo "Installing cloudflared (Oracle Linux / RPM)..."
-          #     sudo tee /etc/yum.repos.d/cloudflared.repo > /dev/null <<'REPO'
-          #   [cloudflared]
-          #   name=Cloudflare cloudflared
-          #   baseurl=https://pkg.cloudflare.com/cloudflared/rpm/el/$releasever/$basearch
-          #   enabled=1
-          #   gpgcheck=1
-          #   gpgkey=https://pkg.cloudflare.com/cloudflare-main.gpg
-          #   REPO
+          #     curl -fsSL https://pkg.cloudflare.com/cloudflared.repo \
+          #       | sudo tee /etc/yum.repos.d/cloudflared.repo > /dev/null
           #     sudo dnf install -y cloudflared
           #     echo "cloudflared installed: $(cloudflared --version)"
           #   else
           #     echo "cloudflared already installed: $(cloudflared --version)"
           #   fi
-          SCRIPT_B64="c2V0IC1ldW8gcGlwZWZhaWwKaWYgISBjb21tYW5kIC12IGNsb3VkZmxhcmVkICY+L2Rldi9udWxsOyB0aGVuCiAgZWNobyAiSW5zdGFsbGluZyBjbG91ZGZsYXJlZCAoT3JhY2xlIExpbnV4IC8gUlBNKS4uLiIKICAjIEFkZCBDbG91ZGZsYXJlIFJQTSByZXBvCiAgc3VkbyB0ZWUgL2V0Yy95dW0ucmVwb3MuZC9jbG91ZGZsYXJlZC5yZXBvID4gL2Rldi9udWxsIDw8J1JFUE8nCltjbG91ZGZsYXJlZF0KbmFtZT1DbG91ZGZsYXJlIGNsb3VkZmxhcmVkCmJhc2V1cmw9aHR0cHM6Ly9wa2cuY2xvdWRmbGFyZS5jb20vY2xvdWRmbGFyZWQvcnBtL2VsLyRyZWxlYXNldmVyLyRiYXNlYXJjaAplbmFibGVkPTEKZ3BnY2hlY2s9MQpncGdrZXk9aHR0cHM6Ly9wa2cuY2xvdWRmbGFyZS5jb20vY2xvdWRmbGFyZS1tYWluLmdwZwpSRVBPCiAgc3VkbyBkbmYgaW5zdGFsbCAteSBjbG91ZGZsYXJlZAogIGVjaG8gImNsb3VkZmxhcmVkIGluc3RhbGxlZDogJChjbG91ZGZsYXJlZCAtLXZlcnNpb24pIgplbHNlCiAgZWNobyAiY2xvdWRmbGFyZWQgYWxyZWFkeSBpbnN0YWxsZWQ6ICQoY2xvdWRmbGFyZWQgLS12ZXJzaW9uKSIKZmkK"
+          SCRIPT_B64="c2V0IC1ldW8gcGlwZWZhaWwKaWYgISBjb21tYW5kIC12IGNsb3VkZmxhcmVkICY+L2Rldi9udWxsOyB0aGVuCiAgZWNobyAiSW5zdGFsbGluZyBjbG91ZGZsYXJlZCAoT3JhY2xlIExpbnV4IC8gUlBNKS4uLiIKICBjdXJsIC1mc1NMIGh0dHBzOi8vcGtnLmNsb3VkZmxhcmUuY29tL2Nsb3VkZmxhcmVkLnJlcG8gXAogICAgfCBzdWRvIHRlZSAvZXRjL3l1bS5yZXBvcy5kL2Nsb3VkZmxhcmVkLnJlcG8gPiAvZGV2L251bGwKICBzdWRvIGRuZiBpbnN0YWxsIC15IGNsb3VkZmxhcmVkCiAgZWNobyAiY2xvdWRmbGFyZWQgaW5zdGFsbGVkOiAkKGNsb3VkZmxhcmVkIC0tdmVyc2lvbikiCmVsc2UKICBlY2hvICJjbG91ZGZsYXJlZCBhbHJlYWR5IGluc3RhbGxlZDogJChjbG91ZGZsYXJlZCAtLXZlcnNpb24pIgpmaQo="
 
           echo "$SCRIPT_B64" | base64 -d | \
             ssh -i ~/.ssh/id_oci -o StrictHostKeyChecking=no opc@"$IP" 'bash -s'
