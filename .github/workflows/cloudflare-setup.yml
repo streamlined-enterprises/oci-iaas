@@ -119,7 +119,7 @@ jobs:
             "$OCI_USER" "$OCI_FINGERPRINT" "$OCI_TENANCY" "$OCI_REGION" > ~/.oci/config
           chmod 600 ~/.oci/config
 
-      # ── Discover VM public IP ──────────────────────────────────────────────
+      # ── Discover VM public IP ───────────────────────────────────────────────
 
       - name: Get VM public IP from OCI
         id: vm
@@ -141,7 +141,7 @@ jobs:
           echo "Found public IP: ${PUBLIC_IP}"
           echo "ip=${PUBLIC_IP}" >> $GITHUB_OUTPUT
 
-      # ── SSH setup ─────────────────────────────────────────────────────────
+      # ── SSH setup ──────────────────────────────────────────────────────────
 
       - name: Write SSH private key
         run: |
@@ -163,7 +163,7 @@ jobs:
             sleep 10
           done
 
-      # ── Install cloudflared ───────────────────────────────────────────────
+      # ── Install cloudflared ─────────────────────────────────────────────────
       # Remote scripts are base64-encoded so the YAML file contains only
       # properly-indented lines.  The runner decodes them at runtime.
       #
@@ -185,28 +185,26 @@ jobs:
           echo "$SCRIPT_B64" | base64 -d | \
             ssh -i ~/.ssh/id_oci -o StrictHostKeyChecking=no opc@"$IP" 'bash -s'
 
-      # ── Register tunnel + enable service ──────────────────────────────────
-      # Token delivery uses a two-phase approach to avoid all shell-quoting
-      # and sed fragility:
+      # ── Register tunnel + enable service ────────────────────────────────────
+      # Token delivery — immune to newlines, special chars, and shell quoting:
       #
-      #   Phase 1 — Write token: printf the token (whitespace-stripped) into
-      #             /tmp/.cf_token on the VM via a dedicated SSH command.
-      #             The token travels only inside the encrypted SSH stream.
+      #   Phase 1: base64-encode the token on the runner (printf | base64 -w0)
+      #            pipe the safe b64 string over SSH
+      #            decode with base64 -d on the VM → /tmp/.cf_token
       #
-      #   Phase 2 — Run script: pipe the install script separately.
-      #             It reads CF_TOKEN from the file, rm -f's it immediately,
-      #             then calls `cloudflared service install`.
+      #   Phase 2: install script reads CF_TOKEN=$(cat /tmp/.cf_token),
+      #            rm -f's the file immediately, then runs service install.
 
       - name: Deliver tunnel token to VM
         env:
           CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
         run: |
           IP="${{ steps.vm.outputs.ip }}"
-          # Strip all whitespace/newlines from the token before writing
-          CLEAN_TOKEN=$(printf '%s' "${CF_TUNNEL_TOKEN}" | tr -d '[:space:]')
-          printf '%s' "${CLEAN_TOKEN}" | \
+          # base64-encode the raw token so it survives the pipe completely intact
+          TOKEN_B64=$(printf '%s' "${CF_TUNNEL_TOKEN}" | base64 -w0)
+          printf '%s' "${TOKEN_B64}" | \
             ssh -i ~/.ssh/id_oci -o StrictHostKeyChecking=no opc@"$IP" \
-            'cat > /tmp/.cf_token && chmod 600 /tmp/.cf_token'
+            'base64 -d > /tmp/.cf_token && chmod 600 /tmp/.cf_token'
 
       - name: Register and enable cloudflared service
         run: |
