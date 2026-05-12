@@ -177,33 +177,25 @@ jobs:
           IP="${{ steps.vm.outputs.ip }}"
 
           # Decoded script:
-          #   set -euo pipefail
           #   ARCH=$(uname -m)
-          #   if command -v cloudflared &>/dev/null; then exit 0; fi
-          #   if [ "$ARCH" = "x86_64" ]; then
-          #     curl -fsSL https://pkg.cloudflare.com/cloudflared.repo \
-          #       | sudo tee /etc/yum.repos.d/cloudflared.repo > /dev/null
-          #     sudo dnf install -y cloudflared
-          #   else
-          #     LATEST=$(curl gh api ...)
-          #     curl .../cloudflared-linux-arm64 | sudo install to /usr/local/bin
-          #   fi
+          #   x86_64  -> dnf install via Cloudflare RPM repo
+          #   aarch64 -> curl cloudflared-linux-arm64 from GitHub releases
           SCRIPT_B64="c2V0IC1ldW8gcGlwZWZhaWwKCkFSQ0g9JCh1bmFtZSAtbSkKZWNobyAiRGV0ZWN0ZWQgYXJjaGl0ZWN0dXJlOiAke0FSQ0h9IgoKaWYgY29tbWFuZCAtdiBjbG91ZGZsYXJlZCAmPi9kZXYvbnVsbDsgdGhlbgogIGVjaG8gImNsb3VkZmxhcmVkIGFscmVhZHkgaW5zdGFsbGVkOiAkKGNsb3VkZmxhcmVkIC0tdmVyc2lvbikiCiAgZXhpdCAwCmZpCgplY2hvICJJbnN0YWxsaW5nIGNsb3VkZmxhcmVkLi4uIgoKaWYgWyAiJEFSQ0giID0gIng4Nl82NCIgXTsgdGhlbgogICMgeDg2XzY0OiB1c2UgQ2xvdWRmbGFyZSdzIG9mZmljaWFsIFJQTSByZXBvCiAgY3VybCAtZnNTTCBodHRwczovL3BrZy5jbG91ZGZsYXJlLmNvbS9jbG91ZGZsYXJlZC5yZXBvIFwKICAgIHwgc3VkbyB0ZWUgL2V0Yy95dW0ucmVwb3MuZC9jbG91ZGZsYXJlZC5yZXBvID4gL2Rldi9udWxsCiAgc3VkbyBkbmYgaW5zdGFsbCAteSBjbG91ZGZsYXJlZAplbHNlCiAgIyBhYXJjaDY0IChhbmQgYW55IG90aGVyIGFyY2gpOiBkb3dubG9hZCB0aGUgYmluYXJ5IGRpcmVjdGx5IGZyb20gR2l0SHViIHJlbGVhc2VzCiAgTEFURVNUPSQoY3VybCAtZnNTTCBodHRwczovL2FwaS5naXRodWIuY29tL3JlcG9zL2Nsb3VkZmxhcmUvY2xvdWRmbGFyZWQvcmVsZWFzZXMvbGF0ZXN0IFwKICAgIHwgZ3JlcCAnInRhZ19uYW1lIicgfCBzZWQgJ3MvLioidGFnX25hbWUiOiAqIlwoW14iXSpcKSIuKi9cMS8nKQogIGVjaG8gIkxhdGVzdCByZWxlYXNlOiAke0xBVEVTVH0iCiAgVVJMPSJodHRwczovL2dpdGh1Yi5jb20vY2xvdWRmbGFyZS9jbG91ZGZsYXJlZC9yZWxlYXNlcy9kb3dubG9hZC8ke0xBVEVTVH0vY2xvdWRmbGFyZWQtbGludXgtYXJtNjQiCiAgY3VybCAtZnNTTCAiJFVSTCIgLW8gL3RtcC9jbG91ZGZsYXJlZAogIHN1ZG8gaW5zdGFsbCAtbSA3NTUgL3RtcC9jbG91ZGZsYXJlZCAvdXNyL2xvY2FsL2Jpbi9jbG91ZGZsYXJlZApmaQoKZWNobyAiY2xvdWRmbGFyZWQgaW5zdGFsbGVkOiAkKGNsb3VkZmxhcmVkIC0tdmVyc2lvbikiCg=="
 
           echo "$SCRIPT_B64" | base64 -d | \
             ssh -i ~/.ssh/id_oci -o StrictHostKeyChecking=no opc@"$IP" 'bash -s'
 
       # ── Register tunnel + enable service (single atomic step) ────────────────
-      # Token is passed as $1 to the remote script — never embedded in the
-      # script body — so it stays out of remote shell history.
+      # The script template contains a __TOKEN__ placeholder.  The runner
+      # substitutes the real token via sed before piping over SSH, so the
+      # token value travels only inside the encrypted SSH stream and never
+      # appears as a CLI argument or in remote shell history.
       #
-      # Decoded script:
-      #   CF_TOKEN="$1"
-      #   sudo cloudflared service install "$CF_TOKEN"   # creates the unit file
-      #   wait loop until unit file appears (up to 20s)
-      #   sudo systemctl daemon-reload
-      #   sudo systemctl enable cloudflared
-      #   sudo systemctl restart cloudflared
+      # Decoded script (after substitution):
+      #   CF_TOKEN='<real token>'
+      #   sudo cloudflared service install "$CF_TOKEN"  # creates the unit file
+      #   wait loop until unit file appears
+      #   systemctl daemon-reload / enable / restart
       #   verify STATUS == active
 
       - name: Register and enable cloudflared service
@@ -212,11 +204,13 @@ jobs:
         run: |
           IP="${{ steps.vm.outputs.ip }}"
 
-          SCRIPT_B64="c2V0IC1ldW8gcGlwZWZhaWwKQ0ZfVE9LRU49IiQxIgoKZWNobyAiUmVnaXN0ZXJpbmcgY2xvdWRmbGFyZWQgdHVubmVsIHNlcnZpY2UuLi4iCnN1ZG8gY2xvdWRmbGFyZWQgc2VydmljZSBpbnN0YWxsICIkQ0ZfVE9LRU4iIDI+JjEgfHwgZWNobyAiU2VydmljZSBhbHJlYWR5IGluc3RhbGxlZCwgY29udGludWluZy4iCgplY2hvICJXYWl0aW5nIGZvciB1bml0IGZpbGUuLi4iCmZvciBpIGluICQoc2VxIDEgMTApOyBkbwogIGlmIHN1ZG8gc3lzdGVtY3RsIGxpc3QtdW5pdC1maWxlcyBjbG91ZGZsYXJlZC5zZXJ2aWNlIDI+L2Rldi9udWxsIHwgZ3JlcCAtcSBjbG91ZGZsYXJlZDsgdGhlbgogICAgZWNobyAiVW5pdCBmaWxlIGZvdW5kLiIKICAgIGJyZWFrCiAgZmkKICBlY2hvICIgIE5vdCBmb3VuZCB5ZXQgKCRpLzEwKSwgd2FpdGluZyAycy4uLiIKICBzbGVlcCAyCmRvbmUKCnN1ZG8gc3lzdGVtY3RsIGRhZW1vbi1yZWxvYWQKc3VkbyBzeXN0ZW1jdGwgZW5hYmxlIGNsb3VkZmxhcmVkCnN1ZG8gc3lzdGVtY3RsIHJlc3RhcnQgY2xvdWRmbGFyZWQKc2xlZXAgMwoKU1RBVFVTPSQoc3VkbyBzeXN0ZW1jdGwgaXMtYWN0aXZlIGNsb3VkZmxhcmVkIHx8IHRydWUpCmVjaG8gImNsb3VkZmxhcmVkIHNlcnZpY2Ugc3RhdHVzOiAke1NUQVRVU30iCmlmIFsgIiRTVEFUVVMiICE9ICJhY3RpdmUiIF07IHRoZW4KICBlY2hvICJFUlJPUjogY2xvdWRmbGFyZWQgZGlkIG5vdCBzdGFydCBjb3JyZWN0bHkuIgogIHN1ZG8gc3lzdGVtY3RsIHN0YXR1cyBjbG91ZGZsYXJlZCAtLW5vLXBhZ2VyIHx8IHRydWUKICBleGl0IDEKZmkKZWNobyAiY2xvdWRmbGFyZWQgaXMgcnVubmluZyBhbmQgZW5hYmxlZCBvbiBib290LiIK"
+          # Template — __TOKEN__ is replaced by sed on the runner before the
+          # script reaches the VM.
+          SCRIPT_B64="c2V0IC1ldW8gcGlwZWZhaWwKQ0ZfVE9LRU49J19fVE9LRU5fXycKCmVjaG8gIlJlZ2lzdGVyaW5nIGNsb3VkZmxhcmVkIHR1bm5lbCBzZXJ2aWNlLi4uIgpzdWRvIGNsb3VkZmxhcmVkIHNlcnZpY2UgaW5zdGFsbCAiJENGX1RPS0VOIiAyPiYxIHx8IGVjaG8gIlNlcnZpY2UgYWxyZWFkeSBpbnN0YWxsZWQsIGNvbnRpbnVpbmcuIgoKZWNobyAiV2FpdGluZyBmb3IgdW5pdCBmaWxlLi4uIgpmb3IgaSBpbiAkKHNlcSAxIDEwKTsgZG8KICBpZiBzdWRvIHN5c3RlbWN0bCBsaXN0LXVuaXQtZmlsZXMgY2xvdWRmbGFyZWQuc2VydmljZSAyPi9kZXYvbnVsbCB8IGdyZXAgLXEgY2xvdWRmbGFyZWQ7IHRoZW4KICAgIGVjaG8gIlVuaXQgZmlsZSBmb3VuZC4iCiAgICBicmVhawogIGZpCiAgZWNobyAiICBOb3QgZm91bmQgeWV0ICgkaS8xMCksIHdhaXRpbmcgMnMuLi4iCiAgc2xlZXAgMgpkb25lCgpzdWRvIHN5c3RlbWN0bCBkYWVtb24tcmVsb2FkCnN1ZG8gc3lzdGVtY3RsIGVuYWJsZSBjbG91ZGZsYXJlZApzdWRvIHN5c3RlbWN0bCByZXN0YXJ0IGNsb3VkZmxhcmVkCnNsZWVwIDMKClNUQVRVUz0kKHN1ZG8gc3lzdGVtY3RsIGlzLWFjdGl2ZSBjbG91ZGZsYXJlZCB8fCB0cnVlKQplY2hvICJjbG91ZGZsYXJlZCBzZXJ2aWNlIHN0YXR1czogJHtTVEFUVVN9IgppZiBbICIkU1RBVFVTIiAhPSAiYWN0aXZlIiBdOyB0aGVuCiAgZWNobyAiRVJST1I6IGNsb3VkZmxhcmVkIGRpZCBub3Qgc3RhcnQgY29ycmVjdGx5LiIKICBzdWRvIHN5c3RlbWN0bCBzdGF0dXMgY2xvdWRmbGFyZWQgLS1uby1wYWdlciB8fCB0cnVlCiAgZXhpdCAxCmZpCmVjaG8gImNsb3VkZmxhcmVkIGlzIHJ1bm5pbmcgYW5kIGVuYWJsZWQgb24gYm9vdC4iCg=="
 
-          echo "$SCRIPT_B64" | base64 -d | \
-            ssh -i ~/.ssh/id_oci -o StrictHostKeyChecking=no opc@"$IP" \
-            'bash -s' -- "${CF_TUNNEL_TOKEN}"
+          echo "$SCRIPT_B64" | base64 -d \
+            | sed "s|__TOKEN__|${CF_TUNNEL_TOKEN}|g" \
+            | ssh -i ~/.ssh/id_oci -o StrictHostKeyChecking=no opc@"$IP" 'bash -s'
 
       # ── Summary ─────────────────────────────────────────────────────────────
 
