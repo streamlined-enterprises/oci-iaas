@@ -145,6 +145,14 @@ jobs:
           ssh -i ~/.ssh/id_oci -o StrictHostKeyChecking=no opc@"$IP" bash <<'ENDSSH'
           set -euo pipefail
 
+          # -- Fix: Cloudflare's RPM repo doesn't publish aarch64 packages.
+          # The cloudflared binary was installed directly from GitHub releases by
+          # cloudflare-setup.yml, but the repo file it left behind causes every
+          # subsequent `dnf` invocation to fail with a 404 on aarch64.
+          # Disable it so dnf metadata refreshes cleanly.
+          sudo dnf config-manager --set-disabled cloudflared 2>/dev/null || \
+            sudo sed -i 's/^enabled=1/enabled=0/' /etc/yum.repos.d/cloudflared.repo 2>/dev/null || true
+
           # -- Node.js ----------------------------------------------------------
           if ! command -v node &>/dev/null; then
             echo "Installing Node.js 20.x (LTS)..."
