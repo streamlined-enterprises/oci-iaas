@@ -1,1 +1,266 @@
+name: n8n Setup
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Run modes:
+#
+#  1. Standalone  — trigger manually via workflow_dispatch, providing env_name.
+#
+#  2. Chained     — triggered automatically when "Cloudflare Setup" completes
+#                   successfully.  env_name is recovered from an artifact
+#                   uploaded by build-vm.yml (see comment below).
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      env_name:
+        description: 'Environment name — must match the prefix used in build-vm.yml (e.g. prod, worker-1)'
+        required: true
+        default: 'prod'
+
+  workflow_run:
+    workflows:
+      - 'Cloudflare Setup'
+    types:
+      - completed
+
+env:
+  OCI_REGION: us-chicago-1
+  COMPARTMENT_OCID: ${{ secrets.OCI_COMPARTMENT_OCID }}
+  OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: True
+  SUPPRESS_LABEL_WARNING: True
+
+jobs:
+  n8n-setup:
+    runs-on: ubuntu-latest
+
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+
+    steps:
+      - name: Resolve env_name (standalone)
+        id: env
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ENV_NAME="${{ inputs.env_name }}"
+          else
+            ENV_NAME="prod"
+          fi
+          echo "name=${ENV_NAME}" >> $GITHUB_OUTPUT
+          echo "Mode: ${{ github.event_name }}, env_name=${ENV_NAME}"
+
+      - name: Download env_name artifact (chained mode)
+        if: github.event_name == 'workflow_run'
+        uses: actions/download-artifact@v4
+        with:
+          name: build-vm-env-name
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.event.workflow_run.id }}
+        continue-on-error: true
+
+      - name: Override env_name from artifact (chained mode)
+        if: github.event_name == 'workflow_run'
+        id: env_override
+        run: |
+          if [ -f env_name.txt ]; then
+            ENV_NAME=$(tr -d '[:space:]' < env_name.txt)
+            echo "Resolved from artifact: ${ENV_NAME}"
+          else
+            ENV_NAME="${{ steps.env.outputs.name }}"
+            echo "Artifact not found, using default: ${ENV_NAME}"
+          fi
+          echo "name=${ENV_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Set final env_name
+        id: resolved_env
+        run: |
+          NAME="${{ steps.env_override.outputs.name || steps.env.outputs.name }}"
+          echo "name=${NAME}" >> $GITHUB_OUTPUT
+          echo "Final env_name: ${NAME}"
+
+      - name: Install OCI CLI
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh -o install.sh
+          bash install.sh --accept-all-defaults
+          echo "$HOME/bin" >> $GITHUB_PATH
+
+      - name: Configure OCI CLI
+        env:
+          OCI_USER: ${{ secrets.OCI_USER_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_TENANCY: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_KEY: ${{ secrets.OCI_API_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.oci
+          echo "$OCI_KEY" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+          printf '[DEFAULT]\nuser=%s\nfingerprint=%s\ntenancy=%s\nregion=%s\nkey_file=/home/runner/.oci/oci_api_key.pem\n' \
+            "$OCI_USER" "$OCI_FINGERPRINT" "$OCI_TENANCY" "$OCI_REGION" > ~/.oci/config
+          chmod 600 ~/.oci/config
+
+      - name: Get VM public IP from OCI
+        id: vm
+        run: |
+          ENV_NAME="${{ steps.resolved_env.outputs.name }}"
+          PIP_NAME="${ENV_NAME}-reserved-ip"
+
+          PUBLIC_IP=$(oci network public-ip list \
+            --compartment-id "$COMPARTMENT_OCID" \
+            --scope REGION \
+            --query "data[?\"display-name\"=='${PIP_NAME}'] | [0].\"ip-address\"" \
+            --raw-output 2>/dev/null || true)
+
+          if [ -z "$PUBLIC_IP" ] || [ "$PUBLIC_IP" = "null" ]; then
+            echo "ERROR: Could not find reserved IP named '${PIP_NAME}'."
+            exit 1
+          fi
+
+          echo "Found public IP: ${PUBLIC_IP}"
+          echo "ip=${PUBLIC_IP}" >> $GITHUB_OUTPUT
+
+      - name: Write SSH private key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_oci
+          chmod 600 ~/.ssh/id_oci
+          ssh-keyscan -H "${{ steps.vm.outputs.ip }}" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Wait for SSH to be ready
+        run: |
+          IP="${{ steps.vm.outputs.ip }}"
+          for i in $(seq 1 12); do
+            if ssh -i ~/.ssh/id_oci -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+                 opc@"$IP" 'echo ok' 2>/dev/null; then
+              echo "SSH is ready."
+              break
+            fi
+            echo "Attempt $i/12 failed, retrying in 10s..."
+            sleep 10
+          done
+
+      - name: Install Node.js and n8n on VM
+        run: |
+          IP="${{ steps.vm.outputs.ip }}"
+          ssh -i ~/.ssh/id_oci -o StrictHostKeyChecking=no opc@"$IP" bash <<'ENDSSH'
+          set -euo pipefail
+
+          # -- Node.js ----------------------------------------------------------
+          if ! command -v node &>/dev/null; then
+            echo "Installing Node.js 20.x (LTS)..."
+            curl -fsSL https://rpm.nodesource.com/setup_20.x | sudo bash -
+            sudo dnf install -y nodejs
+          else
+            echo "Node.js already installed: $(node --version)"
+          fi
+
+          # -- n8n --------------------------------------------------------------
+          if ! command -v n8n &>/dev/null; then
+            echo "Installing n8n globally..."
+            sudo npm install -g n8n
+          else
+            echo "n8n already installed: $(n8n --version)"
+          fi
+
+          echo "Node: $(node --version)  npm: $(npm --version)  n8n: $(n8n --version)"
+          ENDSSH
+
+      - name: Configure and start n8n systemd service
+        run: |
+          IP="${{ steps.vm.outputs.ip }}"
+          ssh -i ~/.ssh/id_oci -o StrictHostKeyChecking=no opc@"$IP" bash <<'ENDSSH'
+          set -euo pipefail
+
+          N8N_BIN=$(command -v n8n)
+
+          # -- systemd unit -----------------------------------------------------
+          sudo tee /etc/systemd/system/n8n.service > /dev/null <<EOF
+          [Unit]
+          Description=n8n workflow automation
+          After=network.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User=opc
+          Environment=N8N_PORT=5678
+          Environment=N8N_PROTOCOL=http
+          Environment=N8N_HOST=127.0.0.1
+          Environment=GENERIC_TIMEZONE=UTC
+          Environment=N8N_LOG_LEVEL=info
+          ExecStart=${N8N_BIN} start
+          Restart=on-failure
+          RestartSec=5
+          StandardOutput=journal
+          StandardError=journal
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          sudo systemctl daemon-reload
+          sudo systemctl enable n8n
+          sudo systemctl restart n8n
+          sleep 5
+
+          STATUS=$(sudo systemctl is-active n8n || true)
+          echo "n8n service status: ${STATUS}"
+          if [ "$STATUS" != "active" ]; then
+            echo "ERROR: n8n did not start correctly."
+            sudo systemctl status n8n --no-pager || true
+            exit 1
+          fi
+          echo "n8n is running and enabled on boot, listening on 127.0.0.1:5678"
+          ENDSSH
+
+      - name: Expose n8n via cloudflared tunnel
+        run: |
+          IP="${{ steps.vm.outputs.ip }}"
+          N8N_HOSTNAME="${{ secrets.N8N_HOSTNAME }}"
+          ACCOUNT_ID="${{ secrets.CF_ACCOUNT_ID }}"
+          TUNNEL_ID="${{ secrets.CF_TUNNEL_ID }}"
+          CF_API_TOKEN="${{ secrets.CF_API_TOKEN }}"
+
+          # Update tunnel ingress via Cloudflare API (runner-side — no need to SSH)
+          echo "Adding public hostname ${N8N_HOSTNAME} → localhost:5678 via Cloudflare API..."
+          RESPONSE=$(curl -fsSL -X PUT \
+            "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/cfd_tunnel/${TUNNEL_ID}/configurations" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data-raw '{
+              "config": {
+                "ingress": [
+                  {
+                    "hostname": "'"${N8N_HOSTNAME}"'",
+                    "service": "http://127.0.0.1:5678"
+                  },
+                  {
+                    "service": "http_status:404"
+                  }
+                ]
+              }
+            }')
+
+          echo "$RESPONSE" | grep -q '"success":true' && \
+            echo "Ingress rule added successfully." || {
+            echo "ERROR: Failed to update tunnel ingress configuration."
+            echo "Response: $RESPONSE"
+            exit 1
+          }
+
+          # Restart cloudflared on the VM so it picks up the new ingress config
+          ssh -i ~/.ssh/id_oci -o StrictHostKeyChecking=no opc@"$IP" \
+            'sudo systemctl restart cloudflared && sleep 3 && sudo systemctl is-active cloudflared'
+
+      - name: Summary
+        run: |
+          ENV_NAME="${{ steps.resolved_env.outputs.name }}"
+          N8N_HOSTNAME="${{ secrets.N8N_HOSTNAME }}"
+          echo "## n8n Setup Complete — ${ENV_NAME}" >> $GITHUB_STEP_SUMMARY
+          echo "| | |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Environment** | ${ENV_NAME} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **VM IP** | ${{ steps.vm.outputs.ip }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **n8n** | installed + running as systemd service on \`127.0.0.1:5678\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Public URL** | https://${N8N_HOSTNAME} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Tunnel** | cloudflared ingress updated + restarted |" >> $GITHUB_STEP_SUMMARY
