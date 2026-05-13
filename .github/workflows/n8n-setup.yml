@@ -221,42 +221,82 @@ jobs:
           echo "n8n is running and enabled on boot, listening on 127.0.0.1:5678"
           ENDSSH
 
-      - name: Expose n8n via cloudflared tunnel
+      - name: Update cloudflared tunnel ingress config
         run: |
-          IP="${{ steps.vm.outputs.ip }}"
           N8N_HOSTNAME="${{ secrets.N8N_HOSTNAME }}"
           ACCOUNT_ID="${{ secrets.CF_ACCOUNT_ID }}"
           TUNNEL_ID="${{ secrets.CF_TUNNEL_ID }}"
           CF_API_TOKEN="${{ secrets.CF_API_TOKEN }}"
 
-          # Update tunnel ingress via Cloudflare API (runner-side — no need to SSH)
-          echo "Adding public hostname ${N8N_HOSTNAME} → localhost:5678 via Cloudflare API..."
+          echo "Updating tunnel ingress: ${N8N_HOSTNAME} → http://127.0.0.1:5678"
           RESPONSE=$(curl -fsSL -X PUT \
             "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/cfd_tunnel/${TUNNEL_ID}/configurations" \
             -H "Authorization: Bearer ${CF_API_TOKEN}" \
             -H "Content-Type: application/json" \
-            --data-raw '{
+            -d '{
               "config": {
                 "ingress": [
-                  {
-                    "hostname": "'"${N8N_HOSTNAME}"'",
-                    "service": "http://127.0.0.1:5678"
-                  },
-                  {
-                    "service": "http_status:404"
-                  }
+                  {"hostname": "'"${N8N_HOSTNAME}"'", "service": "http://127.0.0.1:5678"},
+                  {"service": "http_status:404"}
                 ]
               }
             }')
 
           echo "$RESPONSE" | grep -q '"success":true' && \
-            echo "Ingress rule added successfully." || {
-            echo "ERROR: Failed to update tunnel ingress configuration."
-            echo "Response: $RESPONSE"
+            echo "Tunnel ingress updated." || {
+            echo "ERROR: Failed to update tunnel ingress."
+            echo "$RESPONSE"
             exit 1
           }
 
-          # Restart cloudflared on the VM so it picks up the new ingress config
+      - name: Create DNS CNAME record for n8n hostname
+        run: |
+          N8N_HOSTNAME="${{ secrets.N8N_HOSTNAME }}"
+          ZONE_ID="${{ secrets.CF_ZONE_ID }}"
+          TUNNEL_ID="${{ secrets.CF_TUNNEL_ID }}"
+          CF_API_TOKEN="${{ secrets.CF_API_TOKEN }}"
+
+          # Extract subdomain name (everything before the first dot)
+          RECORD_NAME=$(echo "${N8N_HOSTNAME}" | cut -d'.' -f1)
+
+          echo "Checking for existing CNAME record '${RECORD_NAME}'..."
+          EXISTING=$(curl -fsSL \
+            "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records?type=CNAME&name=${N8N_HOSTNAME}" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/json")
+
+          RECORD_ID=$(echo "$EXISTING" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+          CNAME_TARGET="${TUNNEL_ID}.cfargotunnel.com"
+          PAYLOAD=$(printf '{"type":"CNAME","name":"%s","content":"%s","proxied":true,"ttl":1}' \
+            "${N8N_HOSTNAME}" "${CNAME_TARGET}")
+
+          if [ -n "$RECORD_ID" ] && [ "$RECORD_ID" != "null" ]; then
+            echo "Record exists (${RECORD_ID}), updating..."
+            RESPONSE=$(curl -fsSL -X PUT \
+              "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records/${RECORD_ID}" \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "${PAYLOAD}")
+          else
+            echo "No existing record found, creating..."
+            RESPONSE=$(curl -fsSL -X POST \
+              "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records" \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "${PAYLOAD}")
+          fi
+
+          echo "$RESPONSE" | grep -q '"success":true' && \
+            echo "DNS CNAME ${N8N_HOSTNAME} → ${CNAME_TARGET} (proxied) created/updated." || {
+            echo "ERROR: Failed to create/update DNS record."
+            echo "$RESPONSE"
+            exit 1
+          }
+
+      - name: Restart cloudflared to apply new ingress
+        run: |
+          IP="${{ steps.vm.outputs.ip }}"
           ssh -i ~/.ssh/id_oci -o StrictHostKeyChecking=no opc@"$IP" \
             'sudo systemctl restart cloudflared && sleep 3 && sudo systemctl is-active cloudflared'
 
@@ -271,4 +311,5 @@ jobs:
           echo "| **VM IP** | ${{ steps.vm.outputs.ip }} |" >> $GITHUB_STEP_SUMMARY
           echo "| **n8n** | installed + running as systemd service on \`127.0.0.1:5678\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Public URL** | https://${N8N_HOSTNAME} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **DNS** | CNAME record created/updated (proxied) |" >> $GITHUB_STEP_SUMMARY
           echo "| **Tunnel** | cloudflared ingress updated + restarted |" >> $GITHUB_STEP_SUMMARY
